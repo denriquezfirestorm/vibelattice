@@ -893,7 +893,7 @@ textarea.code {
 
 .trefftz-plot {
   width: 100%;
-  height: clamp(200px, 30vh, 320px);
+  height: clamp(240px, 36vh, 384px);
   background: var(--panel);
   border-radius: 16px;
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08);
@@ -961,12 +961,12 @@ textarea.code {
   position: absolute;
   top: 6px;
   right: 6px;
-  background: rgba(15, 23, 42, 0.6);
+  background: transparent;
   border-radius: 8px;
   padding: 4px 6px;
   display: grid;
-  gap: 4px;
-  font: 11px Consolas, "Courier New", monospace;
+  gap: 0;
+  font: 16px Consolas, "Courier New", monospace;
   color: #9aa8b7;
 }
 
@@ -974,7 +974,7 @@ textarea.code {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  font: 11px Consolas, "Courier New", monospace;
+  font: 16px Consolas, "Courier New", monospace;
   color: #9aa8b7;
 }
 
@@ -1065,11 +1065,18 @@ textarea.code {
 .trefftz-legend-item {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+  margin: -0.5em 0 0 0;
+  padding: 0;
+  line-height: 1;
+}
+
+.trefftz-legend-item:first-child {
+  margin-top: 0;
 }
 
 .trefftz-legend-item .swatch.line {
-  width: 28px;
+  width: 14px;
   height: 10px;
   stroke-width: 1.2;
   fill: none;

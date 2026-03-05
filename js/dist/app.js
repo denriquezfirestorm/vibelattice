@@ -235,6 +235,11 @@ let trefftzBusyVisible = false;
 let trefftzBusyShownAt = 0;
 let trefftzBusyShowTimer = null;
 let trefftzBusyHideTimer = null;
+const trefftzHoverState = {
+  inside: false,
+  xPx: null,
+  yPx: null,
+};
 let trimRequestId = 0;
 let execRequestId = 0;
 let execRerunPending = false;
@@ -4694,6 +4699,9 @@ els.viewerFlow?.addEventListener('click', () => {
   }
   updateViewerButtons();
 });
+els.trefftz?.addEventListener('pointermove', handleTrefftzPointerMove);
+els.trefftz?.addEventListener('pointerdown', handleTrefftzPointerMove);
+els.trefftz?.addEventListener('pointerleave', handleTrefftzPointerLeave);
 els.eigenPlot?.addEventListener('click', handleEigenCanvasClick);
 els.eigenPlot?.addEventListener('wheel', handleEigenCanvasWheel, { passive: false });
 els.eigenPlot?.addEventListener('touchstart', handleEigenTouchStart, { passive: false });
@@ -5069,6 +5077,33 @@ if (els.downloadForcesElement) {
     }
   }
 
+function handleTrefftzPointerMove(evt) {
+  const canvas = els.trefftz;
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  if (!(rect.width > 0) || !(rect.height > 0)) return;
+  const x = Number(evt?.clientX) - rect.left;
+  const y = Number(evt?.clientY) - rect.top;
+  trefftzHoverState.inside = true;
+  trefftzHoverState.xPx = Number.isFinite(x) ? Math.max(0, Math.min(rect.width, x)) : null;
+  trefftzHoverState.yPx = Number.isFinite(y) ? Math.max(0, Math.min(rect.height, y)) : null;
+  if (uiState.trefftzData?.strips?.length) {
+    updateTrefftz(uiState.lastCL ?? Number(els.cl?.value || 0));
+  }
+}
+
+function handleTrefftzPointerLeave(evt) {
+  const coarsePointer = Boolean(window?.matchMedia?.('(pointer: coarse)')?.matches);
+  if (coarsePointer) return;
+  if (!trefftzHoverState.inside && trefftzHoverState.xPx == null && trefftzHoverState.yPx == null) return;
+  trefftzHoverState.inside = false;
+  trefftzHoverState.xPx = null;
+  trefftzHoverState.yPx = null;
+  if (uiState.trefftzData?.strips?.length) {
+    updateTrefftz(uiState.lastCL ?? Number(els.cl?.value || 0));
+  }
+}
+
 function updateTrefftz(cl) {
   uiState.lastCL = cl;
   const canvas = els.trefftz;
@@ -5109,6 +5144,9 @@ function updateTrefftz(cl) {
       window.__trefftzTestHook.zeroLine = null;
       window.__trefftzTestHook.mapAxis = null;
       window.__trefftzTestHook.trefftzRightAxis = null;
+      window.__trefftzTestHook.trefftzPlotBounds = null;
+      window.__trefftzTestHook.trefftzHover = null;
+      window.__trefftzTestHook.trefftzLegendLeft = null;
     }
     uiState.trefftzLayoutVersion = (uiState.trefftzLayoutVersion || 0) + 1;
     if (window.__trefftzTestHook) {
@@ -5392,6 +5430,13 @@ function updateTrefftz(cl) {
 
     let plotW = x1 - x0;
     let plotH = y1 - y0;
+    if (legend) {
+      const legendLeft = Math.max(0, x0);
+      const legendTop = Math.max(0, y0 + 2 - 16);
+      legend.style.left = `${legendLeft}px`;
+      legend.style.right = 'auto';
+      legend.style.top = `${legendTop}px`;
+    }
 
     const axisSpan = (min, max) => (max - min) || 1e-6;
     const axisY = (val, min, max) => y0 + (1 - (val - min) / axisSpan(min, max)) * plotH;
@@ -5511,16 +5556,51 @@ function updateTrefftz(cl) {
       `;
     }
 
-    const drawSeries = (color, idxValue, scaleFn, dash) => {
-      ctx.strokeStyle = color;
+    const crefSafe = (cref || 1.0);
+    const seriesDefs = [
+      {
+        id: 'clp',
+        color: '#ef4444',
+        dash: [6, 4],
+        valueOf: (entry) => Number(entry?.[4]),
+        yOf: (value) => yForC(value),
+      },
+      {
+        id: 'cl',
+        color: '#fb923c',
+        dash: [6, 3, 1.5, 3],
+        valueOf: (entry) => Number(entry?.[3]),
+        yOf: (value) => yForC(value),
+      },
+      {
+        id: 'cnc',
+        color: '#22c55e',
+        dash: [],
+        valueOf: (entry) => Number(entry?.[2]) / crefSafe,
+        yOf: (value) => yForC(value),
+      },
+      {
+        id: 'ai',
+        color: '#3b82f6',
+        dash: [1.5, 3],
+        valueOf: (entry) => -Number(entry?.[5]),
+        yOf: (value) => yForW(value),
+      },
+    ];
+    const drawSeries = (series) => {
+      ctx.strokeStyle = series.color;
       ctx.lineWidth = 1;
-      ctx.setLineDash(dash);
+      ctx.setLineDash(series.dash);
       surfaces.forEach((surf) => {
         ctx.beginPath();
         for (let i = 0; i < surf.count; i += 1) {
           const entry = strips[surf.start + i];
-          const x = xFor(entry[0]);
-          const y = scaleFn(entry[idxValue]);
+          const spanVal = Number(entry?.[0]);
+          const value = series.valueOf(entry);
+          if (!Number.isFinite(spanVal) || !Number.isFinite(value)) continue;
+          const x = xFor(spanVal);
+          const y = series.yOf(value);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
           if (i === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         }
@@ -5529,10 +5609,7 @@ function updateTrefftz(cl) {
       ctx.setLineDash([]);
     };
 
-    drawSeries('#ef4444', 4, yForC, [6, 4]); // c_l_perp
-    drawSeries('#fb923c', 3, yForC, [6, 3, 1.5, 3]); // c_l
-    drawSeries('#22c55e', 2, (v) => yForC(v / (cref || 1.0)), []); // c_l c / c_ref
-    drawSeries('#3b82f6', 5, (v) => yForW(-v), [1.5, 3]); // a_i
+    seriesDefs.forEach((series) => drawSeries(series));
 
     const zeroLine = y0 + plotH - (zeroIdx / ticks) * plotH;
     if (showZeroLine && zeroLine >= y0 && zeroLine <= y0 + plotH) {
@@ -5544,10 +5621,137 @@ function updateTrefftz(cl) {
       ctx.stroke();
     }
 
+    const sampleSeriesAtSpan = (surf, series, spanVal) => {
+      const start = Number(surf?.start) || 0;
+      const count = Number(surf?.count) || 0;
+      if (count <= 0) return null;
+      if (count === 1) {
+        const entry = strips[start];
+        const s0 = Number(entry?.[0]);
+        const v0 = series.valueOf(entry);
+        if (!Number.isFinite(s0) || !Number.isFinite(v0)) return null;
+        if (Math.abs(spanVal - s0) > 1e-6 * Math.max(1, Math.abs(s0))) return null;
+        return { value: v0, yPx: series.yOf(v0) };
+      }
+      for (let i = 0; i < count - 1; i += 1) {
+        const a = strips[start + i];
+        const b = strips[start + i + 1];
+        const s0 = Number(a?.[0]);
+        const s1 = Number(b?.[0]);
+        const v0 = series.valueOf(a);
+        const v1 = series.valueOf(b);
+        if (!Number.isFinite(s0) || !Number.isFinite(s1) || !Number.isFinite(v0) || !Number.isFinite(v1)) continue;
+        const minS = Math.min(s0, s1) - 1e-9;
+        const maxS = Math.max(s0, s1) + 1e-9;
+        if (spanVal < minS || spanVal > maxS) continue;
+        const denom = s1 - s0;
+        const t = Math.abs(denom) > 1e-9 ? ((spanVal - s0) / denom) : 0;
+        const u = Math.max(0, Math.min(1, t));
+        const value = v0 + ((v1 - v0) * u);
+        const yPx = series.yOf(value);
+        return Number.isFinite(yPx) ? { value, yPx } : null;
+      }
+      return null;
+    };
+
+    let hoverInfo = {
+      active: false,
+      lineX: null,
+      span: null,
+      markerCount: 0,
+      markers: [],
+    };
+    if (trefftzHoverState.inside && Number.isFinite(trefftzHoverState.xPx) && plotW > 1e-6) {
+      const hoverX = Math.max(x0, Math.min(x1, Number(trefftzHoverState.xPx)));
+      const spanHover = ymin + (((hoverX - x0) / plotW) * (ymax - ymin));
+      const markers = [];
+      surfaces.forEach((surf, surfIdx) => {
+        seriesDefs.forEach((series) => {
+          const sample = sampleSeriesAtSpan(surf, series, spanHover);
+          if (!sample) return;
+          const yPx = Number(sample.yPx);
+          if (!Number.isFinite(yPx) || yPx < (y0 - 2) || yPx > (y1 + 2)) return;
+          markers.push({
+            series: series.id,
+            color: series.color,
+            x: hoverX,
+            y: yPx,
+            value: Number(sample.value),
+            surfaceIndex: surfIdx,
+          });
+        });
+      });
+      ctx.strokeStyle = 'rgba(226,232,240,0.35)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(hoverX, y0);
+      ctx.lineTo(hoverX, y1);
+      ctx.stroke();
+      const spanLabel = fmt(spanHover, 3);
+      const spanLabelY = Math.max(10, y0 - 3);
+      ctx.font = '11px Consolas, "Courier New", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = 'rgba(8, 10, 12, 0.92)';
+      ctx.strokeText(spanLabel, hoverX, spanLabelY);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.fillText(spanLabel, hoverX, spanLabelY);
+      const sortedMarkers = markers
+        .filter((marker) => Number.isFinite(marker.value))
+        .sort((a, b) => a.y - b.y);
+      ctx.font = '11px Consolas, "Courier New", monospace';
+      ctx.textBaseline = 'middle';
+      let prevLabelY = -Infinity;
+      sortedMarkers.forEach((marker) => {
+        ctx.beginPath();
+        ctx.fillStyle = marker.color;
+        ctx.arc(marker.x, marker.y, 3.2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(8, 10, 12, 0.92)';
+        ctx.lineWidth = 1.1;
+        ctx.stroke();
+        const labelText = fmt(marker.value, 3);
+        const labelW = ctx.measureText(labelText).width;
+        const preferRight = (marker.x + 8 + labelW) <= (x1 - 4);
+        ctx.textAlign = preferRight ? 'left' : 'right';
+        let labelY = Math.max(y0 + 6, Math.min(y1 - 6, marker.y));
+        if (labelY < prevLabelY + 11) labelY = Math.min(y1 - 6, prevLabelY + 11);
+        prevLabelY = labelY;
+        const labelX = preferRight ? (marker.x + 8) : (marker.x - 8);
+        ctx.lineWidth = 2.2;
+        ctx.strokeStyle = 'rgba(8, 10, 12, 0.92)';
+        ctx.strokeText(labelText, labelX, labelY);
+        ctx.fillStyle = marker.color;
+        ctx.fillText(labelText, labelX, labelY);
+      });
+      hoverInfo = {
+        active: true,
+        lineX: hoverX,
+        span: spanHover,
+        spanLabel,
+        spanLabelY,
+        markerCount: sortedMarkers.length,
+        markers: sortedMarkers.map((marker) => ({
+          series: marker.series,
+          color: marker.color,
+          x: marker.x,
+          y: marker.y,
+          value: marker.value,
+          label: fmt(marker.value, 3),
+          surfaceIndex: marker.surfaceIndex,
+        })),
+      };
+    }
+
     if (window.__trefftzTestHook) {
       const zeroWLine = yForW(0);
       window.__trefftzTestHook.gridY = gridYPositions;
       window.__trefftzTestHook.zeroLine = zeroLine;
+      window.__trefftzTestHook.trefftzPlotBounds = { x0, x1, y0, y1, plotW, plotH };
+      window.__trefftzTestHook.trefftzLegendLeft = legend ? x0 : null;
+      window.__trefftzTestHook.trefftzHover = hoverInfo;
       window.__trefftzTestHook.mapAxis = {
         axisY,
         axisYWithZero,
