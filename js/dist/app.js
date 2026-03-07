@@ -5040,12 +5040,16 @@ if (els.downloadForcesStrip) {
       logDebug('Strip forces download skipped: no EXEC results yet.');
       return;
     }
-    const lines = buildForcesStripLines(result);
-    if (!lines.length) {
+    const rows = buildForcesStripRows(result);
+    if (rows.length <= 1) {
       logDebug('Strip forces download skipped: no strip data available.');
       return;
     }
-    downloadText(`${uiState.filename || 'model'}_strip_forces.txt`, lines.join('\n'));
+    downloadText(
+      `${uiState.filename || 'model'}_strip_forces.csv`,
+      rowsToCsv(rows),
+      'text/csv;charset=utf-8',
+    );
   });
 }
 
@@ -5056,12 +5060,16 @@ if (els.downloadForcesElement) {
       logDebug('Element forces download skipped: no EXEC results yet.');
       return;
     }
-    const lines = buildForcesElementLines(result);
-    if (!lines.length) {
+    const rows = buildForcesElementRows(result);
+    if (rows.length <= 1) {
       logDebug('Element forces download skipped: no element data available.');
       return;
     }
-    downloadText(`${uiState.filename || 'model'}_element_forces.txt`, lines.join('\n'));
+    downloadText(
+      `${uiState.filename || 'model'}_element_forces.csv`,
+      rowsToCsv(rows),
+      'text/csv;charset=utf-8',
+    );
   });
 }
 
@@ -11010,13 +11018,22 @@ function runExecFromText(text) {
       CDSTRP: state.CDSTRP ? Array.from(state.CDSTRP) : null,
       CYSTRP: state.CYSTRP ? Array.from(state.CYSTRP) : null,
       CLSTRP: state.CLSTRP ? Array.from(state.CLSTRP) : null,
+      CHORD: state.CHORD ? Array.from(state.CHORD) : null,
+      WSTRIP: state.WSTRIP ? Array.from(state.WSTRIP) : null,
       CNC: state.CNC ? Array.from(state.CNC) : null,
       CLA_LSTRP: state.CLA_LSTRP ? Array.from(state.CLA_LSTRP) : null,
       CLT_LSTRP: state.CLT_LSTRP ? Array.from(state.CLT_LSTRP) : null,
+      CL_LSTRP: state.CL_LSTRP ? Array.from(state.CL_LSTRP) : null,
+      CD_LSTRP: state.CD_LSTRP ? Array.from(state.CD_LSTRP) : null,
+      CDV_LSTRP: state.CDV_LSTRP ? Array.from(state.CDV_LSTRP) : null,
+      CMC4_LSTRP: state.CMC4_LSTRP ? Array.from(state.CMC4_LSTRP) : null,
+      CMLE_LSTRP: state.CMLE_LSTRP ? Array.from(state.CMLE_LSTRP) : null,
       DWWAKE: state.DWWAKE ? Array.from(state.DWWAKE) : null,
       RLE: state.RLE ? Array.from(state.RLE) : null,
       DCP: state.DCP ? Array.from(state.DCP) : null,
       RV: state.RV ? Array.from(state.RV) : null,
+      DXV: state.DXV ? Array.from(state.DXV) : null,
+      SLOPEC: state.SLOPEC ? Array.from(state.SLOPEC) : null,
       ENSY: state.ENSY ? Array.from(state.ENSY) : null,
       ENSZ: state.ENSZ ? Array.from(state.ENSZ) : null,
       IJFRST: state.IJFRST ? Array.from(state.IJFRST) : null,
@@ -11086,8 +11103,8 @@ function runExecFromText(text) {
   logDebug(`EXEC dispatched (${fmt(dt, 1)} ms)`);
 }
 
-function downloadText(filename, text) {
-  const blob = new Blob([text], { type: 'text/plain' });
+function downloadText(filename, text, mimeType = 'text/plain;charset=utf-8') {
+  const blob = new Blob([text], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
@@ -11098,31 +11115,156 @@ function downloadText(filename, text) {
   URL.revokeObjectURL(url);
 }
 
-function buildForcesStripLines(result) {
-  const lines = [];
-  const idx2 = (i, j, dim1) => i + dim1 * j;
-  if (result?.CDSTRP && result.CLSTRP && result.CYSTRP && result.RLE) {
-    for (let j = 1; j < result.CLSTRP.length; j += 1) {
-      const y = result.RLE[idx2(2, j, 4)];
-      const z = result.RLE[idx2(3, j, 4)];
-      const cnc = result.CNC?.[j] ?? 0;
-      const cla = result.CLA_LSTRP?.[j] ?? 0;
-      const clt = result.CLT_LSTRP?.[j] ?? 0;
-      const dw = result.DWWAKE?.[j] ?? 0;
-      lines.push(`${j}: y ${fmt(y, 3)} z ${fmt(z, 3)} CL ${fmt(result.CLSTRP[j], 5)} CD ${fmt(result.CDSTRP[j], 5)} CY ${fmt(result.CYSTRP[j], 5)} CNC ${fmt(cnc, 5)} CLA ${fmt(cla, 5)} CLT ${fmt(clt, 5)} DW ${fmt(dw, 5)}`);
-    }
-  }
-  return lines;
+function escapeCsvCell(value) {
+  const text = String(value ?? '');
+  if (!/[",\n\r]/.test(text)) return text;
+  return `"${text.replace(/"/g, '""')}"`;
 }
 
-function buildForcesElementLines(result) {
-  const lines = [];
-  if (result?.DCP) {
-    for (let i = 1; i < result.DCP.length; i += 1) {
-      lines.push(`${i}: DCP ${fmt(result.DCP[i], 6)}`);
+function rowsToCsv(rows) {
+  if (!Array.isArray(rows) || !rows.length) return '';
+  return rows
+    .map((row) => (Array.isArray(row) ? row : [row]).map((cell) => escapeCsvCell(cell)).join(','))
+    .join('\n');
+}
+
+function buildForcesStripRows(result) {
+  const rows = [[
+    'strip_idx',
+    'surface_idx',
+    'Xle',
+    'Yle',
+    'Zle',
+    'Chord',
+    'Area',
+    'c_cl',
+    'ai',
+    'cl_norm',
+    'cl',
+    'cd',
+    'cdv',
+    'cm_c/4',
+    'cm_LE',
+    'C.P.x/c',
+  ]];
+  const idx2 = (i, j, dim1) => i + dim1 * j;
+  const jfrst = Array.isArray(result?.JFRST) ? result.JFRST : null;
+  const nj = Array.isArray(result?.NJ) ? result.NJ : null;
+  const surfaceForStrip = (stripIdx) => {
+    if (!jfrst || !nj) return 0;
+    const nSurf = Math.min(jfrst.length - 1, nj.length - 1);
+    for (let n = 1; n <= nSurf; n += 1) {
+      const start = Number(jfrst[n]) || 0;
+      const count = Number(nj[n]) || 0;
+      if (start <= 0 || count <= 0) continue;
+      if (stripIdx >= start && stripIdx < start + count) return n;
+    }
+    return 0;
+  };
+  if (result?.CDSTRP && result.CLSTRP && result.CYSTRP && result.RLE) {
+    for (let j = 1; j < result.CLSTRP.length; j += 1) {
+      const xle = Number(result.RLE[idx2(1, j, 4)]);
+      const y = result.RLE[idx2(2, j, 4)];
+      const z = result.RLE[idx2(3, j, 4)];
+      const chord = Number(result.CHORD?.[j] ?? 0);
+      const wstrip = Number(result.WSTRIP?.[j] ?? 0);
+      const area = (Number.isFinite(chord) && Number.isFinite(wstrip)) ? (chord * wstrip) : 0;
+      // AVL strip-force table reports c_cl as chord-scaled local cl.
+      const ccl = Number(result.CNC?.[j] ?? 0);
+      const ai = Number(result.DWWAKE?.[j] ?? 0);
+      const clNorm = Number(result.CLT_LSTRP?.[j] ?? 0);
+      const cl = Number(result.CL_LSTRP?.[j] ?? result.CLSTRP?.[j] ?? 0);
+      const cd = Number(result.CD_LSTRP?.[j] ?? result.CDSTRP?.[j] ?? 0);
+      const cdv = Number(result.CDV_LSTRP?.[j] ?? 0);
+      const cmC4 = Number(result.CMC4_LSTRP?.[j] ?? 0);
+      const cmLe = Number(result.CMLE_LSTRP?.[j] ?? (cmC4 - (0.25 * cl)));
+      const cpXc = Math.abs(cl) > 1e-12 ? (-cmLe / cl) : Number.NaN;
+      rows.push([
+        String(j),
+        String(surfaceForStrip(j)),
+        fmt(xle, 5),
+        fmt(y, 5),
+        fmt(z, 5),
+        fmt(chord, 5),
+        fmt(area, 5),
+        fmt(ccl, 5),
+        fmt(ai, 5),
+        fmt(clNorm, 5),
+        fmt(cl, 5),
+        fmt(cd, 5),
+        fmt(cdv, 5),
+        fmt(cmC4, 5),
+        fmt(cmLe, 5),
+        Number.isFinite(cpXc) ? fmt(cpXc, 5) : '-',
+      ]);
     }
   }
-  return lines;
+  return rows;
+}
+
+function buildForcesElementRows(result) {
+  const rows = [['element_idx', 'strip_idx', 'surface_idx', 'X', 'Y', 'Z', 'DX', 'Slope', 'dCp.']];
+  const idx2 = (i, j, dim1) => i + dim1 * j;
+  const dcp = Array.isArray(result?.DCP) ? result.DCP : null;
+  const rv = Array.isArray(result?.RV) ? result.RV : null;
+  const rv1 = Array.isArray(result?.RV1) ? result.RV1 : null;
+  const rv2 = Array.isArray(result?.RV2) ? result.RV2 : null;
+  const dxv = Array.isArray(result?.DXV) ? result.DXV : null;
+  const slopec = Array.isArray(result?.SLOPEC) ? result.SLOPEC : null;
+  const ijfrst = Array.isArray(result?.IJFRST) ? result.IJFRST : null;
+  const nvstrp = Array.isArray(result?.NVSTRP) ? result.NVSTRP : null;
+  const jfrst = Array.isArray(result?.JFRST) ? result.JFRST : null;
+  const nj = Array.isArray(result?.NJ) ? result.NJ : null;
+  if (!dcp || !ijfrst || !nvstrp) return rows;
+  const nStrips = Math.min(ijfrst.length - 1, nvstrp.length - 1);
+  const surfaceForStrip = (stripIdx) => {
+    if (!jfrst || !nj) return 0;
+    const nSurf = Math.min(jfrst.length - 1, nj.length - 1);
+    for (let n = 1; n <= nSurf; n += 1) {
+      const start = Number(jfrst[n]) || 0;
+      const count = Number(nj[n]) || 0;
+      if (start <= 0 || count <= 0) continue;
+      if (stripIdx >= start && stripIdx < start + count) return n;
+    }
+    return 0;
+  };
+  for (let j = 1; j <= nStrips; j += 1) {
+    const i1 = Number(ijfrst[j]) || 0;
+    const nv = Number(nvstrp[j]) || 0;
+    if (i1 <= 0 || nv <= 0) continue;
+    for (let k = 0; k < nv; k += 1) {
+      const iv = i1 + k;
+      let x = Number.NaN;
+      let y = Number.NaN;
+      let z = Number.NaN;
+      if (rv1 && rv2) {
+        // Match AVL OUTELE output: midpoint of RV1/RV2 for element center.
+        x = 0.5 * (Number(rv1[idx2(1, iv, 4)]) + Number(rv2[idx2(1, iv, 4)]));
+        y = 0.5 * (Number(rv1[idx2(2, iv, 4)]) + Number(rv2[idx2(2, iv, 4)]));
+        z = 0.5 * (Number(rv1[idx2(3, iv, 4)]) + Number(rv2[idx2(3, iv, 4)]));
+      } else if (rv) {
+        x = Number(rv[idx2(1, iv, 4)]);
+        y = Number(rv[idx2(2, iv, 4)]);
+        z = Number(rv[idx2(3, iv, 4)]);
+      }
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      // Match AVL OUTELE output fields: DXV(I) and SLOPEC(I).
+      const dx = Number(dxv?.[iv] ?? 0);
+      const slope = Number(slopec?.[iv] ?? 0);
+      rows.push([
+        String(iv),
+        String(j),
+        String(surfaceForStrip(j)),
+        fmt(x, 5),
+        fmt(y, 5),
+        fmt(z, 5),
+        fmt(dx, 5),
+        fmt(slope, 5),
+        fmt(dcp[iv], 6),
+      ]);
+    }
+  }
+  return rows;
 }
 
 function renderHingeGrid(result, parval = null) {

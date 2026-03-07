@@ -1244,6 +1244,11 @@ textarea.code {
   min-width: 0;
 }
 
+.hinge-download-actions {
+  margin: -4px 0 4px;
+  gap: 8px;
+}
+
 .surface-forces-grid .stability-cell {
   min-width: 0;
 }
