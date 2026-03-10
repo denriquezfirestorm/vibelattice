@@ -3911,15 +3911,39 @@ function applyConstraintRowsToState(state, controlMap) {
 
 /* ── Sweep Utility ── */
 
+function buildSweepModalEntries() {
+  const entries = readConstraintRows().map((cr) => ({
+    variable: cr.variable,
+    shortName: cr.variable.startsWith('ctrl:') ? cr.variable.slice(5) : cr.variable,
+    label: cr.row.querySelector('.constraint-cell')?.textContent || cr.variable,
+    constraintLabel: cr.select?.selectedOptions?.[0]?.textContent || cr.constraint,
+    numeric: cr.numeric,
+    inputKey: '',
+  }));
+
+  entries.push({
+    variable: 'input:vel',
+    shortName: 'velocity',
+    label: 'Velocity',
+    constraintLabel: 'Flight condition',
+    numeric: Number(els.vel?.value || 0),
+    inputKey: 'vel',
+  });
+
+  return entries;
+}
+
 function openSweepModal() {
   persistSelectedRunCaseFromUI();
-  const constraintRows = readConstraintRows();
+  const sweepEntries = buildSweepModalEntries();
   els.sweepRows.innerHTML = '';
 
-  constraintRows.forEach((cr) => {
+  sweepEntries.forEach((entry) => {
     const row = document.createElement('div');
     row.className = 'sweep-row disabled';
-    row.dataset.variable = cr.variable;
+    row.dataset.variable = entry.variable;
+    row.dataset.shortName = entry.shortName;
+    if (entry.inputKey) row.dataset.inputKey = entry.inputKey;
 
     const cb = document.createElement('input');
     cb.type = 'checkbox';
@@ -3930,18 +3954,18 @@ function openSweepModal() {
     });
 
     const varLabel = document.createElement('span');
-    varLabel.textContent = cr.row.querySelector('.constraint-cell').textContent;
+    varLabel.textContent = entry.label;
 
     const conLabel = document.createElement('span');
-    conLabel.textContent = cr.select?.selectedOptions?.[0]?.textContent || cr.constraint;
+    conLabel.textContent = entry.constraintLabel;
 
     const startIn = document.createElement('input');
     startIn.type = 'number'; startIn.step = '0.1'; startIn.className = 'sweep-start';
-    startIn.value = cr.numeric; startIn.addEventListener('input', updateSweepCaseCount);
+    startIn.value = entry.numeric; startIn.addEventListener('input', updateSweepCaseCount);
 
     const stopIn = document.createElement('input');
     stopIn.type = 'number'; stopIn.step = '0.1'; stopIn.className = 'sweep-stop';
-    stopIn.value = cr.numeric; stopIn.addEventListener('input', updateSweepCaseCount);
+    stopIn.value = entry.numeric; stopIn.addEventListener('input', updateSweepCaseCount);
 
     const deltaIn = document.createElement('input');
     deltaIn.type = 'number'; deltaIn.step = '0.1'; deltaIn.className = 'sweep-delta';
@@ -3968,6 +3992,8 @@ function getSweepDefinitions() {
     const cb = row.querySelector('.sweep-enable');
     if (!cb?.checked) return;
     const variable = row.dataset.variable;
+    const shortName = row.dataset.shortName || variable;
+    const inputKey = row.dataset.inputKey || '';
     const start = Number(row.querySelector('.sweep-start')?.value || 0);
     const stop = Number(row.querySelector('.sweep-stop')?.value || 0);
     const delta = Number(row.querySelector('.sweep-delta')?.value || 1);
@@ -3979,8 +4005,7 @@ function getSweepDefinitions() {
       for (let v = start; v >= stop - 1e-9; v += delta) values.push(Math.round(v * 1e6) / 1e6);
     }
     if (values.length > 0) {
-      const shortName = variable.startsWith('ctrl:') ? variable.slice(5) : variable;
-      defs.push({ variable, shortName, values });
+      defs.push({ variable, shortName, values, inputKey });
     }
   });
   return defs;
@@ -4022,8 +4047,14 @@ function generateSweepCases() {
     const nameParts = [];
     combo.forEach((val, i) => {
       const def = sweepDefs[i];
-      const idx = rc.constraints.findIndex(c => c.variable === def.variable);
-      if (idx >= 0) rc.constraints[idx].numeric = val;
+      if (def.inputKey) {
+        if (!rc.inputs || typeof rc.inputs !== 'object') rc.inputs = {};
+        rc.inputs[def.inputKey] = val;
+        if (def.inputKey === 'vel') rc.inputs.velLoop = val;
+      } else {
+        const idx = rc.constraints.findIndex(c => c.variable === def.variable);
+        if (idx >= 0) rc.constraints[idx].numeric = val;
+      }
       nameParts.push(`${def.shortName}=${val}`);
     });
     rc.name = nameParts.join(',');

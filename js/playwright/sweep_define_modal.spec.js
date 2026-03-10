@@ -117,6 +117,41 @@ test('Single-variable sweep generates correct run cases', async ({ page }) => {
   }
 });
 
+test('Velocity appears in the sweep modal and populates generated cases', async ({ page }) => {
+  const server = await setupPage(page);
+  try {
+    const initialCount = await page.locator('#runCaseList .run-case-item').count();
+
+    await page.fill('#vel', '30');
+    await page.click('#sweepDefineBtn');
+
+    const velocityRow = page.locator('#sweepRows .sweep-row').filter({ hasText: 'Velocity' }).first();
+    await expect(velocityRow).toBeVisible();
+
+    await velocityRow.locator('.sweep-enable').check();
+    await velocityRow.locator('.sweep-start').fill('30');
+    await velocityRow.locator('.sweep-stop').fill('35');
+    await velocityRow.locator('.sweep-delta').fill('5');
+
+    await expect(page.locator('#sweepCaseCount')).toContainText('2 case(s)');
+
+    await page.click('#sweepConfirmBtn');
+    await expect(page.locator('#runCaseList .run-case-item')).toHaveCount(initialCount + 2);
+
+    const titles = page.locator('#runCaseList .run-case-item .run-case-title');
+    const names = [];
+    for (let i = initialCount; i < initialCount + 2; i++) {
+      names.push(await titles.nth(i).inputValue());
+    }
+    expect(names).toEqual(['velocity=30', 'velocity=35']);
+
+    await page.locator('#runCaseList .run-case-item').nth(initialCount + 1).click();
+    await expect(page.locator('#vel')).toHaveValue('35');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test('Two-variable sweep generates cartesian product', async ({ page }) => {
   const server = await setupPage(page);
   try {
