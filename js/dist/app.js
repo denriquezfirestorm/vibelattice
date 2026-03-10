@@ -11,6 +11,7 @@ import {
 } from './flow_induced.js';
 import { parseAVL } from '../shared/avl_parser.js';
 import { parseNumbers } from '../shared/avl_parser.js';
+import { resultsDb } from './results_db.js';
 
 let THREE = null;
 let OrbitControls = null;
@@ -170,6 +171,7 @@ const els = {
   constraintTable: document.getElementById('constraintTable'),
   runCasesInput: document.getElementById('runCasesInput'),
   runCasesSaveBtn: document.getElementById('runCasesSaveBtn'),
+  downloadRunsCsvBtn: document.getElementById('downloadRunsCsvBtn'),
   runCasesMeta: document.getElementById('runCasesMeta'),
   runCaseList: document.getElementById('runCaseList'),
   runCaseAddBtn: document.getElementById('runCaseAddBtn'),
@@ -270,6 +272,7 @@ let trefftzPlot = null;
 let execWorker = null;
 let execTimeoutId = null;
 let trimInProgress = false;
+let _batchExecResolve = null;  // resolved when a batch-run exec completes
 const TREFFTZ_BUSY_SHOW_DELAY_MS = 120;
 const TREFFTZ_BUSY_MIN_VISIBLE_MS = 220;
 let trefftzBusyVisible = false;
@@ -2070,6 +2073,12 @@ function ensureExecWorker() {
         clearTimeout(execTimeoutId);
         execTimeoutId = null;
       }
+      if (_batchExecResolve) {
+        const resolve = _batchExecResolve;
+        _batchExecResolve = null;
+        resolve('error');
+        return;
+      }
       if (trimRerunPending) {
         trimRerunPending = false;
         setTimeout(() => applyTrim(), 0);
@@ -2119,6 +2128,12 @@ function ensureExecWorker() {
       } catch (err) {
         logDebug(`EXEC apply failed: ${err?.message ?? err}`);
       }
+      if (_batchExecResolve) {
+        const resolve = _batchExecResolve;
+        _batchExecResolve = null;
+        resolve();
+        return;
+      }
       if (trimRerunPending) {
         trimRerunPending = false;
         setTimeout(() => applyTrim(), 0);
@@ -2147,6 +2162,12 @@ function ensureExecWorker() {
     if (execTimeoutId) {
       clearTimeout(execTimeoutId);
       execTimeoutId = null;
+    }
+    if (_batchExecResolve) {
+      const resolve = _batchExecResolve;
+      _batchExecResolve = null;
+      resolve('error');
+      return;
     }
     if (trimRerunPending) {
       trimRerunPending = false;
@@ -3219,6 +3240,7 @@ function renderRunCasesList() {
       renderRunCasesList();
       updateRunCasesMeta();
       drawEigenPlot();
+      try { resultsDb.reindexAfterRemoval(idx); } catch { /* ignore */ }
     });
 
     row.addEventListener('click', () => {
@@ -3532,6 +3554,8 @@ function applyLoadedRunCases(parsed, filename, source = 'Loaded', rawText = '') 
   uiState.eigenModes = [];
   uiState.selectedEigenMode = -1;
   stopModeAnimation();
+  // New run cases loaded — previous results are stale.
+  try { resultsDb.clearAll(); } catch { /* ignore */ }
   uiState.runCases = parsed.cases;
   uiState.selectedRunCaseIndex = parsed.selectedIndex;
   uiState.runCasesFilename = filename;
@@ -3624,6 +3648,7 @@ function resetAuxPanelsForNewAvl() {
   drawEigenPlot();
 
   resetMassSessionDefaults();
+  try { resultsDb.clearAll(); } catch { /* ignore */ }
 }
 
 function buildRunsPayload() {
@@ -4554,6 +4579,334 @@ els.runCasesSaveBtn?.addEventListener('click', () => {
   }
 });
 
+/**
+ * Run all cases that don't yet have results in the DB.
+ * Selects each case, triggers exec, waits for completion, then moves on.
+ * @param {function} onProgress - optional callback(completedCount, totalCount)
+ * @returns {Promise<void>}
+ */
+async function runAllCasesForExport(onProgress) {
+  if (!uiState.runCases.length || !uiState.text.trim()) return;
+  const existingIndices = resultsDb.isReady() ? resultsDb.indicesWithResults() : new Set();
+  const toRun = [];
+  for (let i = 0; i < uiState.runCases.length; i++) {
+    if (!existingIndices.has(i)) toRun.push(i);
+  }
+  if (!toRun.length) return;
+
+  // Save current case state before switching
+  persistSelectedRunCaseFromUI();
+  const originalIndex = uiState.selectedRunCaseIndex;
+
+  for (let n = 0; n < toRun.length; n++) {
+    const idx = toRun[n];
+    if (onProgress) onProgress(n, toRun.length);
+
+    // Select the case (applies constraints to UI) without triggering auto-update
+    const prevSuspend = suspendAutoTrim;
+    suspendAutoTrim = true;
+    selectRunCase(idx, { apply: true });
+    suspendAutoTrim = prevSuspend;
+
+    // Wait for any pending exec to finish
+    while (execInProgress || trimInProgress) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    // Run exec and wait for completion via the batch resolve hook
+    await new Promise((resolve) => {
+      _batchExecResolve = resolve;
+      execInProgress = true;
+      updateTrefftzBusy();
+      try {
+        runExecFromText(uiState.text);
+      } catch (err) {
+        logDebug(`Batch EXEC failed for case ${idx}: ${err?.message ?? err}`);
+        execInProgress = false;
+        updateTrefftzBusy();
+        _batchExecResolve = null;
+        resolve('error');
+      }
+    });
+  }
+
+  if (onProgress) onProgress(toRun.length, toRun.length);
+
+  // Restore original case selection
+  if (originalIndex >= 0 && originalIndex < uiState.runCases.length) {
+    const prevSuspend = suspendAutoTrim;
+    suspendAutoTrim = true;
+    selectRunCase(originalIndex, { apply: true });
+    suspendAutoTrim = prevSuspend;
+  }
+}
+
+els.downloadRunsCsvBtn?.addEventListener('click', async () => {
+  if (!resultsDb.isReady()) {
+    logDebug('CSV download skipped: results database not ready.');
+    return;
+  }
+  if (!uiState.runCases.length) {
+    logDebug('CSV download skipped: no run cases defined.');
+    return;
+  }
+
+  // Check if any cases need to be run first
+  const existingIndices = resultsDb.indicesWithResults();
+  const missingCount = uiState.runCases.filter((_, i) => !existingIndices.has(i)).length;
+
+  if (missingCount > 0) {
+    // Show loading overlay
+    const overlay = document.getElementById('csvExportOverlay');
+    const progressText = document.getElementById('csvExportProgress');
+    if (overlay) overlay.classList.remove('hidden');
+
+    try {
+      await runAllCasesForExport((done, total) => {
+        if (progressText) progressText.textContent = `Running case ${done + 1} of ${total}…`;
+      });
+    } finally {
+      if (overlay) overlay.classList.add('hidden');
+    }
+  }
+
+  const dbRows = resultsDb.listRuns();
+  if (!dbRows.length) {
+    logDebug('CSV download skipped: no runs in database.');
+    return;
+  }
+
+  // Fetch full rows (with JSON blobs) to extract derivatives & surface forces
+  const fullRows = dbRows.map((r) => resultsDb.getRun(r.id));
+
+  // Collect all control names, surface names, hinge names across all runs
+  const allControlNames = new Set();
+  const allSurfaceNames = new Set();
+  const allHingeNames = new Set();
+  for (const row of fullRows) {
+    if (Array.isArray(row.control_deflections)) {
+      row.control_deflections.forEach((c) => allControlNames.add(c.name));
+    }
+    if (Array.isArray(row.surface_forces)) {
+      row.surface_forces.forEach((s) => allSurfaceNames.add(s.name));
+    }
+    if (Array.isArray(row.hinge_moments)) {
+      row.hinge_moments.forEach((h) => allHingeNames.add(h.name));
+    }
+  }
+  const controlNames = Array.from(allControlNames);
+  const surfaceNames = Array.from(allSurfaceNames);
+  const hingeNames = Array.from(allHingeNames);
+
+  // Stability derivative labels: rows = [a, b, p, q, r, d1..dN], cols = [CL, CY, Cl, Cm, Cn]
+  const sdRowLabels = ['a', 'b', 'p', 'q', 'r', ...controlNames.map((_, i) => `d${i + 1}`)];
+  const sdColLabels = ['CL', 'CY', 'Cl', 'Cm', 'Cn'];
+
+  // Body derivative labels: rows = [u, v, w, p, q, r, d1..dN], cols = [CX, CY, CZ, Cl, Cm, Cn]
+  const bdRowLabels = ['u', 'v', 'w', 'p', 'q', 'r', ...controlNames.map((_, i) => `d${i + 1}`)];
+  const bdColLabels = ['CX', 'CY', 'CZ', 'Cl', 'Cm', 'Cn'];
+
+  // Build header row
+  const header = [
+    'run_id', 'created_at', 'avl_filename', 'run_case_name', 'run_case_index',
+    'alpha_deg', 'beta_deg', 'mach', 'pb2v', 'qc2v', 'rb2v', 'velocity', 'bank_deg',
+    'sref', 'cref', 'bref', 'xref', 'yref', 'zref',
+    'CLtot', 'CDtot', 'CYtot', 'CDvtot', 'CDind', 'span_eff',
+    'CXtot', 'CYtot_body', 'CZtot', 'Cl_mom', 'Cm_mom', 'Cn_mom',
+  ];
+  // Control deflections
+  controlNames.forEach((name) => header.push(`ctrl_${name}`));
+  // Stability derivatives
+  for (const row of sdRowLabels) {
+    for (const col of sdColLabels) {
+      header.push(`SD_${col}_${row}`);
+    }
+  }
+  // Body derivatives
+  for (const row of bdRowLabels) {
+    for (const col of bdColLabels) {
+      header.push(`BD_${col}_${row}`);
+    }
+  }
+  // Surface forces
+  for (const sname of surfaceNames) {
+    for (const coeff of ['CL', 'CD', 'CY', 'Cl', 'Cm', 'Cn']) {
+      header.push(`SF_${sname}_${coeff}`);
+    }
+  }
+  // Hinge moments
+  hingeNames.forEach((name) => {
+    header.push(`HM_${name}_Chinge`);
+    header.push(`HM_${name}_moment`);
+  });
+
+  // Helper: compute stability derivatives from result_json (same logic as renderStabilityGrid)
+  function computeStabilityDerivs(r) {
+    if (!r) return null;
+    const clU = r.CLTOT_U; const cyU = r.CYTOT_U; const cmU = r.CMTOT_U;
+    const clD = r.CLTOT_D; const cyD = r.CYTOT_D;
+    const vinfA = r.VINF_A; const vinfB = r.VINF_B;
+    if (!clU || !cyU || !cmU || !vinfA || !vinfB) return null;
+    const dir = (typeof r.LNASA_SA === 'boolean') ? (r.LNASA_SA ? -1.0 : 1.0) : -1.0;
+    const ca = Math.cos(Number(r.ALFA ?? 0.0));
+    const sa = Math.sin(Number(r.ALFA ?? 0.0));
+    const w0 = Number(r.WROT?.[0] ?? 0.0);
+    const w2 = Number(r.WROT?.[2] ?? 0.0);
+    const rx = (w0 * ca + w2 * sa) * dir;
+    const rz = (w2 * ca - w0 * sa) * dir;
+    const wrotRx = [ca * dir, 0.0, sa * dir];
+    const wrotRz = [-sa * dir, 0.0, ca * dir];
+    const wrotA = [-rx * sa - rz * ca, 0.0, -rz * sa + rx * ca];
+    const dot3 = (a, b) => Number(a[0] || 0) * b[0] + Number(a[1] || 0) * b[1] + Number(a[2] || 0) * b[2];
+    const dA = (arr, add = 0) => (
+      Number(arr[0] || 0) * Number(vinfA[0] || 0)
+      + Number(arr[1] || 0) * Number(vinfA[1] || 0)
+      + Number(arr[2] || 0) * Number(vinfA[2] || 0)
+      + Number(arr[3] || 0) * wrotA[0]
+      + Number(arr[4] || 0) * wrotA[1]
+      + Number(arr[5] || 0) * wrotA[2]
+      + add
+    );
+    const dB = (arr) => dot3(arr, vinfB);
+    const dRX = (arr) => Number(arr[3] || 0) * wrotRx[0] + Number(arr[5] || 0) * wrotRx[2];
+    const dRY = (arr) => Number(arr[4] || 0);
+    const dRZ = (arr) => Number(arr[5] || 0) * wrotRz[2] + Number(arr[3] || 0) * wrotRz[0];
+    const clxU = cmU[0] || []; const cmyU = cmU[1] || []; const cnzU = cmU[2] || [];
+    const crsaxU = Array.from({ length: 6 }, (_, k) => Number(clxU[k] || 0) * ca + Number(cnzU[k] || 0) * sa);
+    const cmsaxU = Array.from({ length: 6 }, (_, k) => Number(cmyU[k] || 0));
+    const cnsaxU = Array.from({ length: 6 }, (_, k) => Number(cnzU[k] || 0) * ca - Number(clxU[k] || 0) * sa);
+    const crsaxA = -Number(r.CMTOT?.[0] ?? 0.0) * sa + Number(r.CMTOT?.[2] ?? 0.0) * ca;
+    const cnsaxA = -Number(r.CMTOT?.[2] ?? 0.0) * sa - Number(r.CMTOT?.[0] ?? 0.0) * ca;
+    const bref = Number.isFinite(r.BREF) ? Number(r.BREF) : 0;
+    const cref = Number.isFinite(r.CREF) ? Number(r.CREF) : 0;
+    const rateScaleP = Math.abs(bref) > 1e-12 ? (2.0 / bref) : 0.0;
+    const rateScaleQ = Math.abs(cref) > 1e-12 ? (2.0 / cref) : 0.0;
+    const rateScaleR = rateScaleP;
+    // rows: [CL, CY, Cl, Cm, Cn]
+    const rows = [];
+    rows.push([dA(clU, r.CLTOT_A ?? 0), dA(cyU, 0), dir * dA(crsaxU, crsaxA), dA(cmsaxU, 0), dir * dA(cnsaxU, cnsaxA)]);
+    rows.push([dB(clU), dB(cyU), dir * dB(crsaxU), dB(cmsaxU), dir * dB(cnsaxU)]);
+    rows.push([dRX(clU) * rateScaleP, dRX(cyU) * rateScaleP, dir * dRX(crsaxU) * rateScaleP, dRX(cmsaxU) * rateScaleP, dir * dRX(cnsaxU) * rateScaleP]);
+    rows.push([dRY(clU) * rateScaleQ, dRY(cyU) * rateScaleQ, dir * dRY(crsaxU) * rateScaleQ, dRY(cmsaxU) * rateScaleQ, dir * dRY(cnsaxU) * rateScaleQ]);
+    rows.push([dRZ(clU) * rateScaleR, dRZ(cyU) * rateScaleR, dir * dRZ(crsaxU) * rateScaleR, dRZ(cmsaxU) * rateScaleR, dir * dRZ(cnsaxU) * rateScaleR]);
+    // control derivatives
+    const cmtD = r.CMTOT_D;
+    const nControl = Math.max((clD?.length ?? 1) - 1, (cyD?.length ?? 1) - 1, ((cmtD?.[0]?.length ?? 1) - 1));
+    const momentX = cmtD?.[0] || []; const momentY = cmtD?.[1] || []; const momentZ = cmtD?.[2] || [];
+    for (let i = 1; i <= nControl; i += 1) {
+      const di = i - 1;
+      const cmxD = Number(momentX[di] || 0); const cmyD = Number(momentY[di] || 0); const cmzD = Number(momentZ[di] || 0);
+      const crsD = cmxD * ca + cmzD * sa;
+      const cnsD = cmzD * ca - cmxD * sa;
+      rows.push([clD?.[di] ?? 0, cyD?.[di] ?? 0, dir * crsD, cmyD, dir * cnsD]);
+    }
+    return rows;
+  }
+
+  // Helper: compute body derivatives from result_json (same logic as renderBodyDerivGrid)
+  function computeBodyDerivs(r) {
+    if (!r) return null;
+    const cfU = r.CFTOT_U; const cmU = r.CMTOT_U;
+    const cfD = r.CFTOT_D; const cmD = r.CMTOT_D;
+    if (!cfU || !cmU) return null;
+    const cxU = cfU[0] || []; const cyU = cfU[1] || []; const czU = cfU[2] || [];
+    const clU = cmU[0] || []; const cmY = cmU[1] || []; const cnU = cmU[2] || [];
+    const bref = Number.isFinite(r.BREF) ? Number(r.BREF) : 0;
+    const cref = Number.isFinite(r.CREF) ? Number(r.CREF) : 0;
+    const rateScaleP = Math.abs(bref) > 1e-12 ? (2.0 / bref) : 0.0;
+    const rateScaleQ = Math.abs(cref) > 1e-12 ? (2.0 / cref) : 0.0;
+    const rateScaleR = rateScaleP;
+    const dir = (typeof r.LNASA_SA === 'boolean') ? (r.LNASA_SA ? -1.0 : 1.0) : -1.0;
+    // rows: [CX, CY, CZ, Cl, Cm, Cn]
+    const rows = [];
+    rows.push([-(cxU[0] ?? 0), -(dir * (cyU[0] ?? 0)), -(czU[0] ?? 0), -(clU[0] ?? 0), -(dir * (cmY[0] ?? 0)), -(cnU[0] ?? 0)]);
+    rows.push([-(dir * (cxU[1] ?? 0)), -(cyU[1] ?? 0), -(dir * (czU[1] ?? 0)), -(dir * (clU[1] ?? 0)), -(cmY[1] ?? 0), -(dir * (cnU[1] ?? 0))]);
+    rows.push([-(cxU[2] ?? 0), -(dir * (cyU[2] ?? 0)), -(czU[2] ?? 0), -(clU[2] ?? 0), -(dir * (cmY[2] ?? 0)), -(cnU[2] ?? 0)]);
+    rows.push([(cxU[3] ?? 0) * rateScaleP, dir * (cyU[3] ?? 0) * rateScaleP, (czU[3] ?? 0) * rateScaleP, (clU[3] ?? 0) * rateScaleP, dir * (cmY[3] ?? 0) * rateScaleP, (cnU[3] ?? 0) * rateScaleP]);
+    rows.push([dir * (cxU[4] ?? 0) * rateScaleQ, (cyU[4] ?? 0) * rateScaleQ, dir * (czU[4] ?? 0) * rateScaleQ, dir * (clU[4] ?? 0) * rateScaleQ, (cmY[4] ?? 0) * rateScaleQ, dir * (cnU[4] ?? 0) * rateScaleQ]);
+    rows.push([(cxU[5] ?? 0) * rateScaleR, dir * (cyU[5] ?? 0) * rateScaleR, (czU[5] ?? 0) * rateScaleR, (clU[5] ?? 0) * rateScaleR, dir * (cmY[5] ?? 0) * rateScaleR, (cnU[5] ?? 0) * rateScaleR]);
+    // control derivatives
+    const nControl = Math.max((cfD?.[0]?.length ?? 1) - 1, (cmD?.[0]?.length ?? 1) - 1);
+    const cxD = cfD?.[0] || []; const cyD2 = cfD?.[1] || []; const czD = cfD?.[2] || [];
+    const clD = cmD?.[0] || []; const cmD1 = cmD?.[1] || []; const cnD = cmD?.[2] || [];
+    for (let i = 1; i <= nControl; i += 1) {
+      const di = i - 1;
+      rows.push([dir * (cxD[di] ?? 0), cyD2[di] ?? 0, dir * (czD[di] ?? 0), dir * (clD[di] ?? 0), cmD1[di] ?? 0, dir * (cnD[di] ?? 0)]);
+    }
+    return rows;
+  }
+
+  // Build data rows
+  const csvRows = [header];
+  for (const row of fullRows) {
+    if (!row) continue;
+    const r = row.result_json || {};
+    const dataRow = [
+      row.id, row.created_at, row.avl_filename || '', row.run_case_name || '', row.run_case_index ?? '',
+      row.alpha_deg ?? '', row.beta_deg ?? '', row.mach ?? '', row.pb2v ?? '', row.qc2v ?? '', row.rb2v ?? '',
+      row.velocity ?? '', row.bank_deg ?? '',
+      row.sref ?? '', row.cref ?? '', row.bref ?? '', row.xref ?? '', row.yref ?? '', row.zref ?? '',
+      row.cltot ?? '', row.cdtot ?? '', row.cytot ?? '', row.cdvtot ?? '', row.cdind ?? '', row.span_eff ?? '',
+      row.cx_tot ?? '', row.cy_tot ?? '', row.cz_tot ?? '', row.cl_mom ?? '', row.cm_mom ?? '', row.cn_mom ?? '',
+    ];
+    // Control deflections
+    const ctrlMap = new Map();
+    if (Array.isArray(row.control_deflections)) {
+      row.control_deflections.forEach((c) => ctrlMap.set(c.name, c.value));
+    }
+    controlNames.forEach((name) => dataRow.push(ctrlMap.get(name) ?? ''));
+    // Stability derivatives
+    const sd = computeStabilityDerivs(r);
+    const sdExpectedRows = 5 + controlNames.length;
+    for (let ri = 0; ri < sdExpectedRows; ri += 1) {
+      for (let ci = 0; ci < 5; ci += 1) {
+        dataRow.push(sd?.[ri]?.[ci] ?? '');
+      }
+    }
+    // Body derivatives
+    const bd = computeBodyDerivs(r);
+    const bdExpectedRows = 6 + controlNames.length;
+    for (let ri = 0; ri < bdExpectedRows; ri += 1) {
+      for (let ci = 0; ci < 6; ci += 1) {
+        dataRow.push(bd?.[ri]?.[ci] ?? '');
+      }
+    }
+    // Surface forces
+    const sfMap = new Map();
+    if (Array.isArray(row.surface_forces)) {
+      row.surface_forces.forEach((s) => sfMap.set(s.name, s));
+    }
+    for (const sname of surfaceNames) {
+      const sf = sfMap.get(sname);
+      dataRow.push(sf?.CL ?? '');
+      dataRow.push(sf?.CD ?? '');
+      dataRow.push(sf?.CY ?? '');
+      dataRow.push(sf?.Cl ?? '');
+      dataRow.push(sf?.Cm ?? '');
+      dataRow.push(sf?.Cn ?? '');
+    }
+    // Hinge moments
+    const hmMap = new Map();
+    if (Array.isArray(row.hinge_moments)) {
+      row.hinge_moments.forEach((h) => hmMap.set(h.name, h));
+    }
+    hingeNames.forEach((name) => {
+      const hm = hmMap.get(name);
+      dataRow.push(hm?.chinge ?? '');
+      dataRow.push(hm?.moment ?? '');
+    });
+
+    csvRows.push(dataRow);
+  }
+
+  downloadText(
+    `${uiState.filename || 'model'}_all_runs.csv`,
+    rowsToCsv(csvRows),
+    'text/csv;charset=utf-8',
+  );
+  logDebug(`CSV downloaded: ${csvRows.length - 1} run(s).`);
+});
+
 els.runCaseAddBtn?.addEventListener('click', () => {
   persistSelectedRunCaseFromUI();
   const name = `Case ${uiState.runCases.length + 1}`;
@@ -4569,6 +4922,28 @@ els.runCaseAddBtn?.addEventListener('click', () => {
   renderRunCasesList();
   updateRunCasesMeta();
   drawEigenPlot();
+});
+
+els.runCaseDeleteAllBtn?.addEventListener('click', () => {
+  if (!uiState.runCases.length) return;
+  if (!confirm(`Delete all ${uiState.runCases.length} run case(s)?`)) return;
+  uiState.runCases = [];
+  uiState.selectedRunCaseIndex = -1;
+  uiState.eigenModesByRunCase = {};
+  uiState.eigenModes = [];
+  uiState.selectedEigenMode = -1;
+  stopModeAnimation();
+  renderRunCasesList();
+  updateRunCasesMeta();
+  drawEigenPlot();
+  try { resultsDb.clearAll(); } catch { /* ignore */ }
+});
+
+els.sweepDefineBtn?.addEventListener('click', openSweepModal);
+els.sweepCancelBtn?.addEventListener('click', () => els.sweepModal.classList.add('hidden'));
+els.sweepConfirmBtn?.addEventListener('click', generateSweepCases);
+els.sweepModal?.addEventListener('click', (evt) => {
+  if (evt.target === els.sweepModal) els.sweepModal.classList.add('hidden');
 });
 
 els.massPropsInput?.addEventListener('change', async (evt) => {
@@ -11350,6 +11725,11 @@ function runExecFromText(text) {
     });
     execInProgress = false;
     updateTrefftzBusy();
+    if (_batchExecResolve) {
+      const resolve = _batchExecResolve;
+      _batchExecResolve = null;
+      resolve();
+    }
     return;
   }
 
@@ -11359,6 +11739,12 @@ function runExecFromText(text) {
     execWorker = null;
     execInProgress = false;
     updateTrefftzBusy();
+    if (_batchExecResolve) {
+      const resolve = _batchExecResolve;
+      _batchExecResolve = null;
+      resolve('error');
+      return;
+    }
     if (trimRerunPending) {
       trimRerunPending = false;
       setTimeout(() => applyTrim(), 0);
@@ -11828,6 +12214,104 @@ function applyExecResults(result) {
   }
   recordAutoUpdateTrace('stage', 'eigen');
   drawEigenPlot();
+
+  // --- Persist run result to SQLite ---
+  // Capture case identity now (before schedule) so deferred save uses the
+  // correct index even if the active case changes before the callback fires.
+  const _dbCaseIndex = activeRunCaseIndex();
+  const _dbCaseEntry = activeRunCaseEntry();
+  schedule(() => {
+    try {
+      if (!resultsDb.isReady()) return;
+      if (_dbCaseIndex < 0) return;  // no run case active — skip DB save
+      const idx2m = (i, j, dim1) => i + dim1 * j;
+      const IRm = 1;
+
+      // Build surface forces array
+      let surfForces = null;
+      if (result.CLSURF && result.CDSURF && result.CYSURF) {
+        surfForces = [];
+        const model = uiState.modelCache;
+        const execNames = Array.isArray(uiState.execSurfaceNames) ? uiState.execSurfaceNames : null;
+        for (let i = 1; i < result.CLSURF.length; i++) {
+          const cm = result.CMSURF?.[i] || [0, 0, 0];
+          surfForces.push({
+            name: execNames?.[i - 1] ?? model?.surfaces?.[i - 1]?.name ?? `Surf ${i}`,
+            CL: result.CLSURF[i], CD: result.CDSURF[i], CY: result.CYSURF[i],
+            Cl: cm[0] ?? 0, Cm: cm[1] ?? 0, Cn: cm[2] ?? 0,
+          });
+        }
+      }
+
+      // Build control deflections
+      let controlDeflections = null;
+      if (result.DELCON) {
+        const model = uiState.modelCache;
+        if (model?.controlMap?.size) {
+          controlDeflections = [];
+          for (const [name, cIdx] of model.controlMap.entries()) {
+            controlDeflections.push({ name, value: result.DELCON[cIdx] ?? 0 });
+          }
+        }
+      }
+
+      // Build hinge moments
+      let hingeMoments = null;
+      const chingeVals = Array.isArray(result.CHINGE) ? result.CHINGE : [];
+      if (chingeVals.length > 1) {
+        const model = uiState.modelCache;
+        const names = model?.controlMap ? Array.from(model.controlMap.keys()) : [];
+        hingeMoments = [];
+        for (let i = 1; i < chingeVals.length; i++) {
+          hingeMoments.push({ name: names[i - 1] ?? `Ctrl ${i}`, chinge: chingeVals[i] });
+        }
+      }
+
+      // Mach from PARVAL
+      let mach = null;
+      if (result.PARVAL) {
+        const machPar = Number(result.PARVAL[idx2m(11, IRm, 30)]);
+        mach = Number.isFinite(machPar) ? machPar : null;
+      }
+      if (mach == null && uiState.modelHeader?.mach != null) {
+        mach = Number(uiState.modelHeader.mach);
+      }
+
+      // Velocity & bank from PARVAL
+      let velocity = null;
+      let bankDeg = null;
+      if (result.PARVAL) {
+        const vPar = Number(result.PARVAL[idx2m(12, IRm, 30)]);
+        if (Number.isFinite(vPar)) velocity = vPar;
+        const phiPar = Number(result.PARVAL[idx2m(8, IRm, 30)]);
+        if (Number.isFinite(phiPar)) bankDeg = phiPar;
+      }
+
+      const meta = {
+        avlFilename: uiState.filename || null,
+        runFilename: uiState.runCasesFilename || null,
+        runCaseName: _dbCaseEntry?.name || null,
+        runCaseIndex: _dbCaseIndex,
+        mach,
+        velocity,
+        bankDeg,
+        controlDeflections,
+        hingeMoments,
+        surfaceForces: surfForces,
+        stabilityDerivs: null,   // raw _U/_D arrays are in result_json
+        bodyDerivs: null,        // raw _U/_D arrays are in result_json
+        stripForces: null,       // available via buildForcesStripRows on result_json
+        elementForces: null,     // available via buildForcesElementRows on result_json
+        eigenmodes: Array.isArray(uiState.eigenModes) && uiState.eigenModes.length
+          ? uiState.eigenModes : null,
+      };
+
+      const runId = resultsDb.saveRun(meta, result);
+      logDebug(`Results DB: saved run id=${runId} (${resultsDb.count()} total)`);
+    } catch (err) {
+      logDebug(`Results DB save failed: ${err?.message ?? err}`);
+    }
+  });
 }
 function fitCameraToObject(obj) {
   if (!camera || !controls || !THREE) return;
@@ -11869,6 +12353,11 @@ window.addEventListener('resize', handleResize);
 
 async function bootApp() {
   suspendAutoTrim = true;
+  try {
+    await resultsDb.init();
+    // Clear results from previous sessions that no longer match the loaded AVL file.
+    if (resultsDb.isReady()) resultsDb.clearStaleForSession(uiState.filename || null);
+  } catch (err) { logDebug(`Results DB init failed: ${err?.message ?? err}`); }
   initTopNav();
   initPanelCollapse();
   await initExampleSelect();

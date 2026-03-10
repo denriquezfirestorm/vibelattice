@@ -23,6 +23,7 @@
   }
   </script>
   <script src="./third_party/vendor/katex/dist/katex.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.11.0/sql-wasm.js"></script>
 </head>
 <body class="vf-theme">
   <header class="app-header">
@@ -183,6 +184,7 @@
               <input id="runCasesInput" type="file" accept=".run,text/plain,application/octet-stream" hidden />
             </label>
             <button id="runCasesSaveBtn" class="btn" type="button">Save Runs</button>
+            <button id="downloadRunsCsvBtn" class="btn" type="button">Download CSV</button>
           </div>
           <div class="file-meta" id="runCasesMeta">No run cases loaded.</div>
           <div id="runCaseList" class="run-cases-list"></div>
@@ -650,5 +652,26 @@ rudder  1.0  0.0  0. 0. 0.  1
       window.open('docs.html', 'vibelattice-docs', 'width=860,height=700,scrollbars=yes');
     });
   </script>
+  <div id="csvExportOverlay" class="csv-export-overlay hidden">
+    <div class="csv-export-modal">
+      <div class="csv-export-spinner"></div>
+      <div id="csvExportProgress" class="csv-export-text">Running cases…</div>
+    </div>
+  </div>
+  <div id="sweepModal" class="sweep-modal-backdrop hidden">
+    <div class="sweep-modal">
+      <div class="sweep-modal-title">Define Sweep</div>
+      <div class="sweep-modal-hint">Select up to 3 variables. Cases are generated as cartesian product.</div>
+      <div class="sweep-rows-header">
+        <span></span><span>Variable</span><span>Constraint</span><span>Start</span><span>Stop</span><span>Delta</span>
+      </div>
+      <div id="sweepRows" class="sweep-rows"></div>
+      <div class="sweep-modal-footer">
+        <span id="sweepCaseCount" class="sweep-case-count"></span>
+        <button id="sweepCancelBtn" class="btn" type="button">Cancel</button>
+        <button id="sweepConfirmBtn" class="btn" type="button">Generate</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
