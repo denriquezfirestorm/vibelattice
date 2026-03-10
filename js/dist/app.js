@@ -154,6 +154,7 @@ const els = {
   outForcesSurface: document.getElementById('outForcesSurface'),
   outForcesBody: document.getElementById('outForcesBody'),
   outHinge: document.getElementById('outHinge'),
+  outEigenmodes: document.getElementById('outEigenmodes'),
   downloadForcesStrip: document.getElementById('downloadForcesStrip'),
   downloadForcesElement: document.getElementById('downloadForcesElement'),
   debugLog: document.getElementById('debugLog'),
@@ -2315,6 +2316,7 @@ function clearComputedOutputsForNewGeometry() {
   renderBodyDerivGrid(null);
   renderSurfaceForcesGrid(null);
   renderHingeGrid(null, null);
+  renderEigenmodesGrid();
 }
 
 function renderStabilityGrid(result) {
@@ -12265,6 +12267,50 @@ function renderHingeGrid(result, parval = null) {
   els.outHinge.innerHTML = html;
 }
 
+function computeEigenFreqDamping(re, im) {
+  const magn = Math.sqrt(re * re + im * im);
+  if (magn === 0) return { omega_n: 0, freq_hz: 0, zeta: 0 };
+  const omega_n = magn;
+  const freq_hz = Math.abs(im) / (2 * Math.PI);
+  const zeta = -re / magn;
+  return { omega_n, freq_hz, zeta };
+}
+
+function renderEigenmodesGrid() {
+  if (!els.outEigenmodes) return;
+  const modes = uiState.eigenModes || [];
+  if (!modes.length) {
+    els.outEigenmodes.textContent = '-';
+    return;
+  }
+  const rows = [['Mode', 'Real', 'Imag', 'Freq (Hz)', '\u03B6 (Damping)', '\u03C9n (rad/s)']];
+  modes.forEach((m, i) => {
+    const { omega_n, freq_hz, zeta } = computeEigenFreqDamping(m.re, m.im);
+    rows.push([
+      `${i + 1}`,
+      m.re,
+      m.im,
+      freq_hz,
+      zeta,
+      omega_n,
+    ]);
+  });
+  const html = rows.map((row, rIdx) => row.map((cell, cIdx) => {
+    if (rIdx === 0) {
+      const cls = cIdx > 0 ? 'stability-cell stability-head stability-colhead' : 'stability-cell stability-head';
+      return `<div class="${cls}">${escapeHtml(String(cell))}</div>`;
+    }
+    if (cIdx === 0) {
+      return `<div class="stability-cell stability-head">${escapeHtml(String(cell))}</div>`;
+    }
+    if (!Number.isFinite(Number(cell))) {
+      return '<div class="stability-cell stability-val"><strong class="stability-num">-</strong></div>';
+    }
+    return `<div class="stability-cell stability-val"><strong class="stability-num">${fmtSignedFixed(Number(cell), 6)}</strong></div>`;
+  }).join('')).join('');
+  els.outEigenmodes.innerHTML = html;
+}
+
 function applyExecResults(result) {
   const normalizedResult = {
     LNASA_SA: true,
@@ -12441,6 +12487,7 @@ function applyExecResults(result) {
       }
 
       renderHingeGrid(result, parval);
+      renderEigenmodesGrid();
     } catch (err) {
       logDebug(`EXEC detail render failed: ${err?.message ?? err}`);
     }
