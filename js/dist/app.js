@@ -175,6 +175,13 @@ const els = {
   runCasesMeta: document.getElementById('runCasesMeta'),
   runCaseList: document.getElementById('runCaseList'),
   runCaseAddBtn: document.getElementById('runCaseAddBtn'),
+  runCaseDeleteAllBtn: document.getElementById('runCaseDeleteAllBtn'),
+  sweepDefineBtn: document.getElementById('sweepDefineBtn'),
+  sweepModal: document.getElementById('sweepModal'),
+  sweepRows: document.getElementById('sweepRows'),
+  sweepCancelBtn: document.getElementById('sweepCancelBtn'),
+  sweepConfirmBtn: document.getElementById('sweepConfirmBtn'),
+  sweepCaseCount: document.getElementById('sweepCaseCount'),
   massPropsInput: document.getElementById('massPropsInput'),
   massPropsSaveBtn: document.getElementById('massPropsSaveBtn'),
   massPropsApplyBtn: document.getElementById('massPropsApplyBtn'),
@@ -1770,9 +1777,9 @@ function renderFileHeaderSummary(header, model = null) {
   showSym(els.fileIysym, header.iysym);
   showSym(els.fileIzsym, header.izsym);
   show(els.fileZsym, header.zsym, 2);
-  show(els.fileSref, header.sref, 2);
-  show(els.fileCref, header.cref, 2);
-  show(els.fileBref, header.bref, 2);
+  show(els.fileSref, header.sref, 3);
+  show(els.fileCref, header.cref, 3);
+  show(els.fileBref, header.bref, 3);
 }
 
 function applyAircraftNameRename() {
@@ -3816,6 +3823,141 @@ function applyConstraintRowsToState(state, controlMap) {
   });
 }
 
+/* ── Sweep Utility ── */
+
+function openSweepModal() {
+  persistSelectedRunCaseFromUI();
+  const constraintRows = readConstraintRows();
+  els.sweepRows.innerHTML = '';
+
+  constraintRows.forEach((cr) => {
+    const row = document.createElement('div');
+    row.className = 'sweep-row disabled';
+    row.dataset.variable = cr.variable;
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'sweep-enable';
+    cb.addEventListener('change', () => {
+      row.classList.toggle('disabled', !cb.checked);
+      enforceSweepCheckboxLimit();
+    });
+
+    const varLabel = document.createElement('span');
+    varLabel.textContent = cr.row.querySelector('.constraint-cell').textContent;
+
+    const conLabel = document.createElement('span');
+    conLabel.textContent = cr.select?.selectedOptions?.[0]?.textContent || cr.constraint;
+
+    const startIn = document.createElement('input');
+    startIn.type = 'number'; startIn.step = '0.1'; startIn.className = 'sweep-start';
+    startIn.value = cr.numeric; startIn.addEventListener('input', updateSweepCaseCount);
+
+    const stopIn = document.createElement('input');
+    stopIn.type = 'number'; stopIn.step = '0.1'; stopIn.className = 'sweep-stop';
+    stopIn.value = cr.numeric; stopIn.addEventListener('input', updateSweepCaseCount);
+
+    const deltaIn = document.createElement('input');
+    deltaIn.type = 'number'; deltaIn.step = '0.1'; deltaIn.className = 'sweep-delta';
+    deltaIn.value = '1'; deltaIn.addEventListener('input', updateSweepCaseCount);
+
+    row.append(cb, varLabel, conLabel, startIn, stopIn, deltaIn);
+    els.sweepRows.appendChild(row);
+  });
+
+  updateSweepCaseCount();
+  els.sweepModal.classList.remove('hidden');
+}
+
+function enforceSweepCheckboxLimit() {
+  const checks = Array.from(els.sweepRows.querySelectorAll('.sweep-enable'));
+  const checkedCount = checks.filter(c => c.checked).length;
+  checks.forEach(c => { if (!c.checked) c.disabled = checkedCount >= 3; });
+  updateSweepCaseCount();
+}
+
+function getSweepDefinitions() {
+  const defs = [];
+  els.sweepRows.querySelectorAll('.sweep-row').forEach(row => {
+    const cb = row.querySelector('.sweep-enable');
+    if (!cb?.checked) return;
+    const variable = row.dataset.variable;
+    const start = Number(row.querySelector('.sweep-start')?.value || 0);
+    const stop = Number(row.querySelector('.sweep-stop')?.value || 0);
+    const delta = Number(row.querySelector('.sweep-delta')?.value || 1);
+    if (!Number.isFinite(start) || !Number.isFinite(stop) || !Number.isFinite(delta) || delta === 0) return;
+    const values = [];
+    if (delta > 0 && stop >= start) {
+      for (let v = start; v <= stop + 1e-9; v += delta) values.push(Math.round(v * 1e6) / 1e6);
+    } else if (delta < 0 && stop <= start) {
+      for (let v = start; v >= stop - 1e-9; v += delta) values.push(Math.round(v * 1e6) / 1e6);
+    }
+    if (values.length > 0) {
+      const shortName = variable.startsWith('ctrl:') ? variable.slice(5) : variable;
+      defs.push({ variable, shortName, values });
+    }
+  });
+  return defs;
+}
+
+function updateSweepCaseCount() {
+  const defs = getSweepDefinitions();
+  if (defs.length === 0) {
+    els.sweepCaseCount.textContent = 'No variables selected';
+    return;
+  }
+  const total = defs.reduce((acc, d) => acc * d.values.length, 1);
+  els.sweepCaseCount.textContent = `${total} case(s) will be generated`;
+}
+
+function cartesianProduct(arrays) {
+  if (arrays.length === 0) return [[]];
+  return arrays.reduce((acc, arr) => {
+    const result = [];
+    acc.forEach(combo => arr.forEach(val => result.push([...combo, val])));
+    return result;
+  }, [[]]);
+}
+
+function generateSweepCases() {
+  const sweepDefs = getSweepDefinitions();
+  if (sweepDefs.length === 0) return;
+
+  const baseCase = captureRunCaseFromUI('');
+  const combos = cartesianProduct(sweepDefs.map(d => d.values));
+
+  if (combos.length > 500) {
+    if (!confirm(`This will generate ${combos.length} run cases. Continue?`)) return;
+  }
+
+  const startIdx = uiState.runCases.length;
+  const newCases = combos.map((combo, ci) => {
+    const rc = JSON.parse(JSON.stringify(baseCase));
+    const nameParts = [];
+    combo.forEach((val, i) => {
+      const def = sweepDefs[i];
+      const idx = rc.constraints.findIndex(c => c.variable === def.variable);
+      if (idx >= 0) rc.constraints[idx].numeric = val;
+      nameParts.push(`${def.shortName}=${val}`);
+    });
+    rc.name = nameParts.join(',');
+    rc.color = caseColorOrFallback(null, startIdx + ci);
+    return rc;
+  });
+
+  uiState.runCases.push(...newCases);
+  uiState.eigenModesByRunCase = {};
+  uiState.eigenModes = [];
+  uiState.selectedEigenMode = -1;
+  stopModeAnimation();
+  uiState.selectedRunCaseIndex = startIdx;
+  applyRunCaseToUI(uiState.runCases[startIdx]);
+  renderRunCasesList();
+  updateRunCasesMeta();
+  drawEigenPlot();
+  els.sweepModal.classList.add('hidden');
+}
+
 function rebuildConstraintUI(model) {
   if (!els.constraintTable) return;
   const controlNames = model?.controlMap ? Array.from(model.controlMap.keys()) : [];
@@ -4937,6 +5079,27 @@ els.runCaseDeleteAllBtn?.addEventListener('click', () => {
   updateRunCasesMeta();
   drawEigenPlot();
   try { resultsDb.clearAll(); } catch { /* ignore */ }
+});
+
+els.sweepDefineBtn?.addEventListener('click', openSweepModal);
+els.sweepCancelBtn?.addEventListener('click', () => els.sweepModal.classList.add('hidden'));
+els.sweepConfirmBtn?.addEventListener('click', generateSweepCases);
+els.sweepModal?.addEventListener('click', (evt) => {
+  if (evt.target === els.sweepModal) els.sweepModal.classList.add('hidden');
+});
+
+els.runCaseDeleteAllBtn?.addEventListener('click', () => {
+  if (!uiState.runCases.length) return;
+  if (!confirm(`Delete all ${uiState.runCases.length} run case(s)?`)) return;
+  uiState.runCases = [];
+  uiState.selectedRunCaseIndex = -1;
+  uiState.eigenModesByRunCase = {};
+  uiState.eigenModes = [];
+  uiState.selectedEigenMode = -1;
+  stopModeAnimation();
+  renderRunCasesList();
+  updateRunCasesMeta();
+  drawEigenPlot();
 });
 
 els.sweepDefineBtn?.addEventListener('click', openSweepModal);
