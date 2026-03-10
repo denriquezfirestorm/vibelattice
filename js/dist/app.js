@@ -28,6 +28,9 @@ const LS_KEY_RUN_NAME = 'vl_run_name';
 function lsSave(key, value) {
   try { localStorage.setItem(key, value); } catch { /* quota exceeded or unavailable */ }
 }
+function lsRemove(key) {
+  try { localStorage.removeItem(key); } catch { /* unavailable */ }
+}
 function lsLoad(key) {
   try { return localStorage.getItem(key); } catch { return null; }
 }
@@ -44,9 +47,12 @@ function saveMassToStorage() {
   }
 }
 function saveRunToStorage() {
-  if (uiState.runCasesText) {
+  if (String(uiState.runCasesText || '').trim()) {
     lsSave(LS_KEY_RUN_TEXT, uiState.runCasesText);
     lsSave(LS_KEY_RUN_NAME, uiState.runCasesFilename || 'untitled.run');
+  } else {
+    lsRemove(LS_KEY_RUN_TEXT);
+    lsRemove(LS_KEY_RUN_NAME);
   }
 }
 
@@ -280,6 +286,13 @@ let execWorker = null;
 let execTimeoutId = null;
 let trimInProgress = false;
 let _batchExecResolve = null;  // resolved when a batch-run exec completes
+function resolveBatchExec(status = 'ok') {
+  if (!_batchExecResolve) return false;
+  const resolve = _batchExecResolve;
+  _batchExecResolve = null;
+  resolve(status);
+  return true;
+}
 const TREFFTZ_BUSY_SHOW_DELAY_MS = 120;
 const TREFFTZ_BUSY_MIN_VISIBLE_MS = 220;
 let trefftzBusyVisible = false;
@@ -2080,10 +2093,7 @@ function ensureExecWorker() {
         clearTimeout(execTimeoutId);
         execTimeoutId = null;
       }
-      if (_batchExecResolve) {
-        const resolve = _batchExecResolve;
-        _batchExecResolve = null;
-        resolve('error');
+      if (resolveBatchExec('error')) {
         return;
       }
       if (trimRerunPending) {
@@ -2135,12 +2145,6 @@ function ensureExecWorker() {
       } catch (err) {
         logDebug(`EXEC apply failed: ${err?.message ?? err}`);
       }
-      if (_batchExecResolve) {
-        const resolve = _batchExecResolve;
-        _batchExecResolve = null;
-        resolve();
-        return;
-      }
       if (trimRerunPending) {
         trimRerunPending = false;
         setTimeout(() => applyTrim(), 0);
@@ -2170,10 +2174,7 @@ function ensureExecWorker() {
       clearTimeout(execTimeoutId);
       execTimeoutId = null;
     }
-    if (_batchExecResolve) {
-      const resolve = _batchExecResolve;
-      _batchExecResolve = null;
-      resolve('error');
+    if (resolveBatchExec('error')) {
       return;
     }
     if (trimRerunPending) {
@@ -3197,11 +3198,13 @@ function renderRunCasesList() {
     title.addEventListener('keydown', (evt) => evt.stopPropagation());
     title.addEventListener('input', () => {
       entry.name = title.value;
+      queueRunCaseStateSync();
     });
     title.addEventListener('change', () => {
       entry.name = String(title.value || '').trim() || `Case ${idx + 1}`;
       title.value = entry.name;
       updateRunCasesMeta();
+      queueRunCaseStateSync();
     });
 
     const color = document.createElement('input');
@@ -3212,6 +3215,7 @@ function renderRunCasesList() {
     color.addEventListener('input', () => {
       entry.color = color.value;
       drawEigenPlot();
+      queueRunCaseStateSync();
     });
 
     const trash = document.createElement('button');
@@ -3247,7 +3251,7 @@ function renderRunCasesList() {
       renderRunCasesList();
       updateRunCasesMeta();
       drawEigenPlot();
-      try { resultsDb.reindexAfterRemoval(idx); } catch { /* ignore */ }
+      refreshRunCasesSerializedState();
     });
 
     row.addEventListener('click', () => {
@@ -3411,6 +3415,29 @@ function normalizeRunCase(raw, index) {
   return { name, color, inputs, constraints };
 }
 
+function buildRunCaseStateSignature(raw, index) {
+  const normalized = normalizeRunCase(raw, index);
+  return JSON.stringify({
+    name: normalized.name,
+    inputs: normalized.inputs,
+    constraints: normalized.constraints,
+  });
+}
+
+function currentRunCaseDbState() {
+  return Array.isArray(uiState.runCases)
+    ? uiState.runCases.map((entry, idx) => ({
+      runCaseIndex: idx,
+      caseSignature: buildRunCaseStateSignature(entry, idx),
+    }))
+    : [];
+}
+
+function syncResultsDbToCurrentRunCases() {
+  if (!resultsDb.isReady()) return;
+  resultsDb.syncCurrentCases(uiState.filename || null, currentRunCaseDbState());
+}
+
 function normalizeRunKey(text) {
   return String(text || '')
     .toLowerCase()
@@ -3561,9 +3588,9 @@ function applyLoadedRunCases(parsed, filename, source = 'Loaded', rawText = '') 
   uiState.eigenModes = [];
   uiState.selectedEigenMode = -1;
   stopModeAnimation();
-  // New run cases loaded — previous results are stale.
-  try { resultsDb.clearAll(); } catch { /* ignore */ }
-  uiState.runCases = parsed.cases;
+  uiState.runCases = Array.isArray(parsed.cases)
+    ? parsed.cases.map((entry, idx) => normalizeRunCase(entry, idx))
+    : [];
   uiState.selectedRunCaseIndex = parsed.selectedIndex;
   uiState.runCasesFilename = filename;
   uiState.runCasesText = String(rawText || buildRunsPayload());
@@ -3579,6 +3606,7 @@ function applyLoadedRunCases(parsed, filename, source = 'Loaded', rawText = '') 
     renderFileHighlight();
     syncFileEditorScroll();
   }
+  try { syncResultsDbToCurrentRunCases(); } catch { /* ignore */ }
 }
 
 function applyLoadedMassProps(props, filename, source = 'Loaded', { applyToActive = true, applyMassInertiaOnly = false, rawText = '' } = {}) {
@@ -3655,6 +3683,7 @@ function resetAuxPanelsForNewAvl() {
   drawEigenPlot();
 
   resetMassSessionDefaults();
+  saveRunToStorage();
   try { resultsDb.clearAll(); } catch { /* ignore */ }
 }
 
@@ -3664,6 +3693,61 @@ function buildRunsPayload() {
     selectedIndex: uiState.selectedRunCaseIndex >= 0 ? uiState.selectedRunCaseIndex : 0,
     cases: uiState.runCases.map((entry, idx) => normalizeRunCase(entry, idx)),
   }, null, 2);
+}
+
+function refreshRunCasesSerializedState({ updateRunEditor = false } = {}) {
+  if (uiState.selectedRunCaseIndex >= 0 && uiState.selectedRunCaseIndex < uiState.runCases.length) {
+    persistSelectedRunCaseFromUI();
+  }
+  uiState.runCases = Array.isArray(uiState.runCases)
+    ? uiState.runCases.map((entry, idx) => normalizeRunCase(entry, idx))
+    : [];
+  uiState.runCasesText = uiState.runCases.length ? buildRunsPayload() : '';
+  updateEditorTabLabels();
+  if (updateRunEditor && uiState.editorTab === 'run' && els.fileText) {
+    const nextText = getEditorTabText('run');
+    if (els.fileText.value !== nextText) {
+      els.fileText.value = nextText;
+      fitFileEditorFontSize();
+      renderFileHighlight();
+      syncFileEditorScroll();
+    }
+  }
+  saveRunToStorage();
+  try { syncResultsDbToCurrentRunCases(); } catch { /* ignore */ }
+}
+
+let runCaseStateSyncTimer = null;
+function queueRunCaseStateSync({ delayMs = 180, updateRunEditor = false } = {}) {
+  clearTimeout(runCaseStateSyncTimer);
+  runCaseStateSyncTimer = setTimeout(() => {
+    runCaseStateSyncTimer = null;
+    refreshRunCasesSerializedState({ updateRunEditor });
+  }, delayMs);
+}
+
+function queueRunCaseStateSyncIfActive(options = {}) {
+  if (!Array.isArray(uiState.runCases) || !uiState.runCases.length) return;
+  if (!Number.isInteger(uiState.selectedRunCaseIndex) || uiState.selectedRunCaseIndex < 0) return;
+  queueRunCaseStateSync(options);
+}
+
+function flushRunCaseState({ updateRunEditor = false } = {}) {
+  if (uiState.editorTab === 'run' && els.fileText) {
+    if (runFileUpdateTimer) {
+      clearTimeout(runFileUpdateTimer);
+      runFileUpdateTimer = null;
+    }
+    uiState.runCasesText = els.fileText.value;
+    applyEditedRunText(uiState.runCasesText);
+    saveRunToStorage();
+    return;
+  }
+  if (runCaseStateSyncTimer) {
+    clearTimeout(runCaseStateSyncTimer);
+    runCaseStateSyncTimer = null;
+  }
+  refreshRunCasesSerializedState({ updateRunEditor });
 }
 
 function focusConstraintCell(rowIndex, column, selectValue = false) {
@@ -3956,6 +4040,7 @@ function generateSweepCases() {
   updateRunCasesMeta();
   drawEigenPlot();
   els.sweepModal.classList.add('hidden');
+  refreshRunCasesSerializedState();
 }
 
 function rebuildConstraintUI(model) {
@@ -4055,6 +4140,8 @@ function rebuildConstraintUI(model) {
       el.addEventListener('input', () => requestAutoUpdate(
         AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN,
       ));
+      el.addEventListener('change', () => queueRunCaseStateSyncIfActive());
+      el.addEventListener('input', () => queueRunCaseStateSyncIfActive());
     });
   });
   updateConstraintDuplicates();
@@ -4691,6 +4778,9 @@ els.runCasesInput?.addEventListener('change', async (evt) => {
 });
 
 els.runCasesSaveBtn?.addEventListener('click', () => {
+  if (uiState.editorTab !== 'run') {
+    flushRunCaseState();
+  }
   const filename = ensureRunFileExtension(uiState.runCasesFilename || 'cases.run');
   uiState.runCasesFilename = filename;
   const sourceText = (() => {
@@ -4729,10 +4819,15 @@ els.runCasesSaveBtn?.addEventListener('click', () => {
  */
 async function runAllCasesForExport(onProgress) {
   if (!uiState.runCases.length || !uiState.text.trim()) return;
-  const existingIndices = resultsDb.isReady() ? resultsDb.indicesWithResults() : new Set();
+  const sessionAvlFilename = uiState.filename || null;
+  const existingSignatures = resultsDb.isReady()
+    ? resultsDb.caseSignaturesByIndex(sessionAvlFilename)
+    : new Map();
   const toRun = [];
   for (let i = 0; i < uiState.runCases.length; i++) {
-    if (!existingIndices.has(i)) toRun.push(i);
+    if (existingSignatures.get(i) !== buildRunCaseStateSignature(uiState.runCases[i], i)) {
+      toRun.push(i);
+    }
   }
   if (!toRun.length) return;
 
@@ -4784,6 +4879,7 @@ async function runAllCasesForExport(onProgress) {
 }
 
 els.downloadRunsCsvBtn?.addEventListener('click', async () => {
+  flushRunCaseState();
   if (!resultsDb.isReady()) {
     logDebug('CSV download skipped: results database not ready.');
     return;
@@ -4792,10 +4888,14 @@ els.downloadRunsCsvBtn?.addEventListener('click', async () => {
     logDebug('CSV download skipped: no run cases defined.');
     return;
   }
+  try { syncResultsDbToCurrentRunCases(); } catch { /* ignore */ }
 
   // Check if any cases need to be run first
-  const existingIndices = resultsDb.indicesWithResults();
-  const missingCount = uiState.runCases.filter((_, i) => !existingIndices.has(i)).length;
+  const sessionAvlFilename = uiState.filename || null;
+  const existingSignatures = resultsDb.caseSignaturesByIndex(sessionAvlFilename);
+  const missingCount = uiState.runCases.filter((entry, i) => (
+    existingSignatures.get(i) !== buildRunCaseStateSignature(entry, i)
+  )).length;
 
   if (missingCount > 0) {
     // Show loading overlay
@@ -4812,14 +4912,12 @@ els.downloadRunsCsvBtn?.addEventListener('click', async () => {
     }
   }
 
-  const dbRows = resultsDb.listRuns();
-  if (!dbRows.length) {
-    logDebug('CSV download skipped: no runs in database.');
+  const fullRows = uiState.runCases.map((_, idx) => resultsDb.getRunByCaseIndex(idx, sessionAvlFilename));
+  const missingAfterRun = fullRows.reduce((count, row) => count + (row ? 0 : 1), 0);
+  if (missingAfterRun > 0) {
+    logDebug(`CSV download skipped: ${missingAfterRun} run case(s) are still missing results.`);
     return;
   }
-
-  // Fetch full rows (with JSON blobs) to extract derivatives & surface forces
-  const fullRows = dbRows.map((r) => resultsDb.getRun(r.id));
 
   // Collect all control names, surface names, hinge names across all runs
   const allControlNames = new Set();
@@ -4983,8 +5081,9 @@ els.downloadRunsCsvBtn?.addEventListener('click', async () => {
   for (const row of fullRows) {
     if (!row) continue;
     const r = row.result_json || {};
+    const currentCase = uiState.runCases[Number(row.run_case_index)] || null;
     const dataRow = [
-      row.id, row.created_at, row.avl_filename || '', row.run_case_name || '', row.run_case_index ?? '',
+      row.id, row.created_at, uiState.filename || row.avl_filename || '', currentCase?.name || row.run_case_name || '', row.run_case_index ?? '',
       row.alpha_deg ?? '', row.beta_deg ?? '', row.mach ?? '', row.pb2v ?? '', row.qc2v ?? '', row.rb2v ?? '',
       row.velocity ?? '', row.bank_deg ?? '',
       row.sref ?? '', row.cref ?? '', row.bref ?? '', row.xref ?? '', row.yref ?? '', row.zref ?? '',
@@ -5064,6 +5163,7 @@ els.runCaseAddBtn?.addEventListener('click', () => {
   renderRunCasesList();
   updateRunCasesMeta();
   drawEigenPlot();
+  refreshRunCasesSerializedState();
 });
 
 els.runCaseDeleteAllBtn?.addEventListener('click', () => {
@@ -5078,7 +5178,7 @@ els.runCaseDeleteAllBtn?.addEventListener('click', () => {
   renderRunCasesList();
   updateRunCasesMeta();
   drawEigenPlot();
-  try { resultsDb.clearAll(); } catch { /* ignore */ }
+  refreshRunCasesSerializedState();
 });
 
 els.sweepDefineBtn?.addEventListener('click', openSweepModal);
@@ -5161,6 +5261,7 @@ els.massPropsApplyBtn?.addEventListener('click', () => {
   requestAutoUpdate(
     AUTO_UPDATE_STAGE.FLIGHT | AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN,
   );
+  queueRunCaseStateSyncIfActive();
 });
 
 els.editorTabAvl?.addEventListener('click', () => applyEditorTab('avl'));
@@ -5189,6 +5290,7 @@ els.editorTabRun?.addEventListener('click', () => applyEditorTab('run'));
       const next = Number(els.massZcg.value);
       if (Number.isFinite(next)) els.zcg.value = String(next);
     }
+    queueRunCaseStateSyncIfActive();
   });
   el.addEventListener('change', () => {
     uiState.massProps = readMassPropsFromUI();
@@ -5202,6 +5304,7 @@ els.editorTabRun?.addEventListener('click', () => applyEditorTab('run'));
     requestAutoUpdate(
       AUTO_UPDATE_STAGE.FLIGHT | AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN,
     );
+    queueRunCaseStateSyncIfActive();
   });
 });
 
@@ -5220,6 +5323,7 @@ els.editorTabRun?.addEventListener('click', () => applyEditorTab('run'));
     if (mirror && document.activeElement !== mirror) {
       mirror.value = String(next);
     }
+    queueRunCaseStateSyncIfActive();
   });
   el.addEventListener('change', () => {
     const next = Number(el.value);
@@ -5234,6 +5338,7 @@ els.editorTabRun?.addEventListener('click', () => applyEditorTab('run'));
     requestAutoUpdate(
       AUTO_UPDATE_STAGE.FLIGHT | AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN,
     );
+    queueRunCaseStateSyncIfActive();
   });
 });
 
@@ -5380,6 +5485,7 @@ els.flightMode?.addEventListener('change', () => {
   requestAutoUpdate(
     AUTO_UPDATE_STAGE.FLIGHT | AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN,
   );
+  queueRunCaseStateSyncIfActive();
 });
 
 if (els.flightMode) {
@@ -5389,22 +5495,27 @@ if (els.flightMode) {
 els.cl?.addEventListener('input', () => {
   updateFlightConditions('cl');
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 els.vel?.addEventListener('input', () => {
   updateFlightConditions('vel');
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 els.bank?.addEventListener('input', () => {
   updateFlightConditions();
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 els.rho?.addEventListener('input', () => {
   updateFlightConditions();
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 els.gee?.addEventListener('input', () => {
   updateFlightConditions();
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 els.mass?.addEventListener('input', () => {
   const next = Number(els.mass.value);
@@ -5418,6 +5529,7 @@ els.mass?.addEventListener('input', () => {
   }
   updateFlightConditions();
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 
 els.toggleViscous?.addEventListener('click', () => {
@@ -5433,18 +5545,22 @@ els.toggleViscous?.addEventListener('click', () => {
 els.clLoop?.addEventListener('input', () => {
   updateFlightConditions('cl');
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 els.velLoop?.addEventListener('input', () => {
   updateFlightConditions('vel');
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 els.radLoop?.addEventListener('input', () => {
   updateFlightConditions('rad');
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 els.facLoop?.addEventListener('input', () => {
   updateFlightConditions();
   requestAutoUpdate(AUTO_UPDATE_STAGE.CONSTRAINTS | AUTO_UPDATE_STAGE.EXEC | AUTO_UPDATE_STAGE.EIGEN);
+  queueRunCaseStateSyncIfActive();
 });
 
 let fileUpdateTimer = null;
@@ -6499,8 +6615,12 @@ if (typeof window !== 'undefined') {
         constraints: Array.isArray(entry?.constraints) ? entry.constraints.map((row) => ({ ...row })) : [],
       })) : [];
       uiState.selectedRunCaseIndex = Number.isInteger(selectedIndex) ? selectedIndex : 0;
+      if (uiState.selectedRunCaseIndex >= 0 && uiState.selectedRunCaseIndex < uiState.runCases.length) {
+        applyRunCaseToUI(uiState.runCases[uiState.selectedRunCaseIndex]);
+      }
       drawEigenPlot();
       renderRunCasesList();
+      refreshRunCasesSerializedState();
     },
     getSelectedEigenMode() {
       return uiState.selectedEigenMode;
@@ -6525,6 +6645,12 @@ if (typeof window !== 'undefined') {
     },
     getSelectedRunCaseIndex() {
       return Number(uiState.selectedRunCaseIndex);
+    },
+    getResultsDbRows() {
+      return resultsDb.isReady() ? resultsDb.listRuns().map((row) => ({ ...row })) : [];
+    },
+    getStoredRunText() {
+      return lsLoad(LS_KEY_RUN_TEXT);
     },
     getLastExecSummary() {
       const result = uiState.lastExecResult;
@@ -11888,11 +12014,6 @@ function runExecFromText(text) {
     });
     execInProgress = false;
     updateTrefftzBusy();
-    if (_batchExecResolve) {
-      const resolve = _batchExecResolve;
-      _batchExecResolve = null;
-      resolve();
-    }
     return;
   }
 
@@ -11902,10 +12023,7 @@ function runExecFromText(text) {
     execWorker = null;
     execInProgress = false;
     updateTrefftzBusy();
-    if (_batchExecResolve) {
-      const resolve = _batchExecResolve;
-      _batchExecResolve = null;
-      resolve('error');
+    if (resolveBatchExec('error')) {
       return;
     }
     if (trimRerunPending) {
@@ -12385,8 +12503,10 @@ function applyExecResults(result) {
   const _dbCaseEntry = activeRunCaseEntry();
   schedule(() => {
     try {
-      if (!resultsDb.isReady()) return;
-      if (_dbCaseIndex < 0) return;  // no run case active — skip DB save
+      if (!resultsDb.isReady() || _dbCaseIndex < 0) {
+        resolveBatchExec();
+        return;  // no run case active — skip DB save
+      }
       const idx2m = (i, j, dim1) => i + dim1 * j;
       const IRm = 1;
 
@@ -12455,6 +12575,7 @@ function applyExecResults(result) {
         runFilename: uiState.runCasesFilename || null,
         runCaseName: _dbCaseEntry?.name || null,
         runCaseIndex: _dbCaseIndex,
+        caseSignature: _dbCaseEntry ? buildRunCaseStateSignature(_dbCaseEntry, _dbCaseIndex) : null,
         mach,
         velocity,
         bankDeg,
@@ -12471,8 +12592,10 @@ function applyExecResults(result) {
 
       const runId = resultsDb.saveRun(meta, result);
       logDebug(`Results DB: saved run id=${runId} (${resultsDb.count()} total)`);
+      resolveBatchExec();
     } catch (err) {
       logDebug(`Results DB save failed: ${err?.message ?? err}`);
+      resolveBatchExec('error');
     }
   });
 }
@@ -12518,8 +12641,6 @@ async function bootApp() {
   suspendAutoTrim = true;
   try {
     await resultsDb.init();
-    // Clear results from previous sessions that no longer match the loaded AVL file.
-    if (resultsDb.isReady()) resultsDb.clearStaleForSession(uiState.filename || null);
   } catch (err) { logDebug(`Results DB init failed: ${err?.message ?? err}`); }
   initTopNav();
   initPanelCollapse();
@@ -12539,6 +12660,12 @@ async function bootApp() {
     rebuildConstraintUI({ controlMap: new Map() });
   }
   await loadDefaultRunAndMass();
+  try {
+    if (resultsDb.isReady()) {
+      resultsDb.clearStaleForSession(uiState.filename || null);
+      syncResultsDbToCurrentRunCases();
+    }
+  } catch (err) { logDebug(`Results DB session sync failed: ${err?.message ?? err}`); }
   if (els.constraintTable) {
     logDebug(`Constraint table rows: ${els.constraintTable.children.length}`);
   } else {
