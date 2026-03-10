@@ -98,9 +98,9 @@
                 </select>
               </div>
               <div class="file-ref-row"><span class="label-text">ZSym</span><input id="fileZsym" type="number" step="0.01" /></div>
-              <div class="file-ref-row"><span class="label-text">Sref</span><input id="fileSref" type="number" step="0.01" /></div>
-              <div class="file-ref-row"><span class="label-text">Cref</span><input id="fileCref" type="number" step="0.01" /></div>
-              <div class="file-ref-row"><span class="label-text">Bref</span><input id="fileBref" type="number" step="0.01" /></div>
+              <div class="file-ref-row"><span class="label-text">Sref</span><input id="fileSref" type="number" step="0.001" /></div>
+              <div class="file-ref-row"><span class="label-text">Cref</span><input id="fileCref" type="number" step="0.001" /></div>
+              <div class="file-ref-row"><span class="label-text">Bref</span><input id="fileBref" type="number" step="0.001" /></div>
             </div>
           </div>
           <div id="airfoilFilesPanel" class="airfoil-files hidden">
@@ -184,11 +184,13 @@
             </label>
             <button id="runCasesSaveBtn" class="btn" type="button">Save Runs</button>
           </div>
-          <div class="file-meta" id="runCasesMeta">No run cases loaded.</div>
-          <div id="runCaseList" class="run-cases-list"></div>
           <div class="row run-case-edit-actions">
             <button id="runCaseAddBtn" class="btn" type="button">Add case</button>
+            <button id="sweepDefineBtn" class="btn" type="button">Define Sweep</button>
+            <button id="runCaseDeleteAllBtn" class="btn" type="button">Delete All</button>
           </div>
+          <div id="runCaseList" class="run-cases-list"></div>
+          <div class="file-meta" id="runCasesMeta">No run cases loaded.</div>
         </div>
       </div>
 
@@ -650,5 +652,20 @@ rudder  1.0  0.0  0. 0. 0.  1
       window.open('docs.html', 'vibelattice-docs', 'width=860,height=700,scrollbars=yes');
     });
   </script>
+  <div id="sweepModal" class="sweep-modal-backdrop hidden">
+    <div class="sweep-modal">
+      <div class="sweep-modal-title">Define Sweep</div>
+      <div class="sweep-modal-hint">Select up to 3 variables. Cases are generated as cartesian product.</div>
+      <div class="sweep-rows-header">
+        <span></span><span>Variable</span><span>Constraint</span><span>Start</span><span>Stop</span><span>Delta</span>
+      </div>
+      <div id="sweepRows" class="sweep-rows"></div>
+      <div class="sweep-modal-footer">
+        <span id="sweepCaseCount" class="sweep-case-count"></span>
+        <button id="sweepCancelBtn" class="btn" type="button">Cancel</button>
+        <button id="sweepConfirmBtn" class="btn" type="button">Generate</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
